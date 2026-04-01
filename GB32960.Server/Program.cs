@@ -13,11 +13,17 @@ var config = new ConfigurationBuilder()
 var serverConfig = new ServerConfig();
 config.GetSection("ServerConfig").Bind(serverConfig);
 
+// 日志配置
+var fileLogConfig = new FileLogConfig();
+config.GetSection("FileLog").Bind(fileLogConfig);
+
 var logLevel = Enum.TryParse<LogLevel>(serverConfig.LogLevel, true, out var lv) ? lv : LogLevel.Information;
 using var loggerFactory = LoggerFactory.Create(builder =>
 {
     builder.SetMinimumLevel(logLevel);
     builder.AddSimpleConsole(options => { options.TimestampFormat = "HH:mm:ss "; options.SingleLine = true; });
+    if (fileLogConfig.Enabled)
+        builder.AddProvider(new FileLoggerProvider(fileLogConfig));
 });
 var logger = loggerFactory.CreateLogger<GB32960TcpServer>();
 
@@ -25,17 +31,35 @@ var logger = loggerFactory.CreateLogger<GB32960TcpServer>();
 var influxConfig = new InfluxDbConfig();
 config.GetSection("InfluxDb").Bind(influxConfig);
 InfluxDbStore? influxStore = null;
-
 if (influxConfig.Enabled)
 {
-    var influxLogger = loggerFactory.CreateLogger<InfluxDbStore>();
-    influxStore = new InfluxDbStore(influxLogger, influxConfig);
+    influxStore = new InfluxDbStore(loggerFactory.CreateLogger<InfluxDbStore>(), influxConfig);
     influxStore.Start();
 }
 
-var server = new GB32960TcpServer(logger, serverConfig, influxStore);
+// 原始报文存档（可选）
+var archiveConfig = new RawArchiveConfig();
+config.GetSection("RawArchive").Bind(archiveConfig);
+RawPacketArchiver? archiver = null;
+if (archiveConfig.Enabled)
+{
+    archiver = new RawPacketArchiver(loggerFactory.CreateLogger<RawPacketArchiver>(), archiveConfig);
+    archiver.Start();
+}
 
-PrintBanner(serverConfig, influxConfig);
+// 上级平台转发（可选）
+var forwarderConfig = new ForwarderConfig();
+config.GetSection("PlatformForwarder").Bind(forwarderConfig);
+PlatformForwarder? forwarder = null;
+if (forwarderConfig.Enabled)
+{
+    forwarder = new PlatformForwarder(loggerFactory.CreateLogger<PlatformForwarder>(), forwarderConfig);
+    forwarder.Start();
+}
+
+var server = new GB32960TcpServer(logger, serverConfig, influxStore, archiver, forwarder);
+
+PrintBanner(serverConfig, influxConfig, archiveConfig, forwarderConfig, fileLogConfig);
 server.Start();
 
 Console.WriteLine("按键: S=统计  A=自动刷新(5s)  L=终端列表  Q=退出");
@@ -82,7 +106,7 @@ Console.WriteLine("服务器已停止。");
 
 // ─── 显示函数 ────────────────────────────────────
 
-static void PrintBanner(ServerConfig cfg, InfluxDbConfig influx)
+static void PrintBanner(ServerConfig cfg, InfluxDbConfig influx, RawArchiveConfig archive, ForwarderConfig fwd, FileLogConfig fileLog)
 {
     Console.ForegroundColor = ConsoleColor.Cyan;
     Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
@@ -92,20 +116,31 @@ static void PrintBanner(ServerConfig cfg, InfluxDbConfig influx)
     Console.WriteLine("╚══════════════════════════════════════════════════════════╝");
     Console.ResetColor();
     Console.WriteLine();
-    Console.WriteLine($"  监听地址: {cfg.IpAddress}:{cfg.Port}");
-    Console.WriteLine($"  最大连接: {cfg.MaxConnections:N0}");
-    Console.WriteLine($"  会话超时: {cfg.SessionTimeoutMinutes} 分钟");
-    Console.WriteLine($"  日志级别: {cfg.LogLevel}");
-    if (influx.Enabled)
+    Console.WriteLine($"  监听地址:   {cfg.IpAddress}:{cfg.Port}");
+    Console.WriteLine($"  最大连接:   {cfg.MaxConnections:N0}");
+    Console.WriteLine($"  会话超时:   {cfg.SessionTimeoutMinutes} 分钟");
+
+    PrintModuleStatus("文件日志", fileLog.Enabled, fileLog.Enabled ? $"{fileLog.Directory}/ (保留{fileLog.RetainDays}天)" : null);
+    PrintModuleStatus("报文存档", archive.Enabled, archive.Enabled ? $"{archive.BaseDirectory}/" : null);
+    PrintModuleStatus("InfluxDB", influx.Enabled, influx.Enabled ? $"{influx.Url} → {influx.Org}/{influx.Bucket}" : null);
+    PrintModuleStatus("平台转发", fwd.Enabled, fwd.Enabled ? $"{fwd.Host}:{fwd.Port}" : null);
+    Console.WriteLine();
+}
+
+static void PrintModuleStatus(string name, bool enabled, string? detail)
+{
+    Console.Write($"  {name,-10}");
+    if (enabled)
     {
         Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"  InfluxDB: {influx.Url} → {influx.Org}/{influx.Bucket} (批量{influx.BatchSize})");
+        Console.Write("● 已启用");
         Console.ResetColor();
+        if (detail != null) Console.Write($"  {detail}");
     }
     else
     {
         Console.ForegroundColor = ConsoleColor.DarkGray;
-        Console.WriteLine("  InfluxDB: 未启用 (修改 appsettings.json 中 Enabled=true 开启)");
+        Console.Write("○ 未启用");
         Console.ResetColor();
     }
     Console.WriteLine();
@@ -156,13 +191,24 @@ static void ShowStatistics(GB32960TcpServer server)
         Console.WriteLine();
     }
 
-    // InfluxDB 统计
+    // 存储/转发统计
     if (server.InfluxStore != null)
     {
-        var store = server.InfluxStore;
-        Console.Write("  InfluxDB: 写入="); WriteColored($"{store.TotalWrites:N0}", ConsoleColor.Green);
-        Console.Write("错误="); WriteColored($"{store.TotalErrors:N0}", store.TotalErrors > 0 ? ConsoleColor.Red : ConsoleColor.Green);
-        Console.Write("队列="); WriteColored($"{store.QueueSize:N0}", ConsoleColor.DarkCyan);
+        var s = server.InfluxStore;
+        Console.Write("  InfluxDB: "); WriteColored($"{s.TotalWrites:N0}写入", ConsoleColor.Green);
+        WriteColored($"{s.TotalErrors:N0}错误", s.TotalErrors > 0 ? ConsoleColor.Red : ConsoleColor.DarkGray);
+        WriteColored($"队列{s.QueueSize:N0}", ConsoleColor.DarkCyan);
+        Console.WriteLine();
+    }
+    if (server.Archiver != null)
+        Console.WriteLine($"  报文存档: {server.Archiver.TotalArchived:N0} 条");
+    if (server.Forwarder != null)
+    {
+        var f = server.Forwarder;
+        Console.Write("  平台转发: "); WriteColored(f.IsConnected ? "已连接" : "未连接", f.IsConnected ? ConsoleColor.Green : ConsoleColor.Red);
+        WriteColored($"{f.TotalForwarded:N0}转发", ConsoleColor.Cyan);
+        WriteColored($"{f.TotalDropped:N0}丢弃", f.TotalDropped > 0 ? ConsoleColor.Red : ConsoleColor.DarkGray);
+        WriteColored($"队列{f.QueueSize:N0}", ConsoleColor.DarkCyan);
         Console.WriteLine();
     }
 

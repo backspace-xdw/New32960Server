@@ -5,3 +5,5 @@ obj/
 .vs/
 *.DotSettings.user
 influxdb2*.deb
+Logs/
+RawData/

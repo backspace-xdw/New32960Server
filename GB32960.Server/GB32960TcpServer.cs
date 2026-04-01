@@ -40,16 +40,23 @@ public class GB32960TcpServer
     public IReadOnlyDictionary<CommandType, long> CommandStats => _commandStats;
     public TimeSpan Uptime => DateTime.Now - _startTime;
 
-    // InfluxDB 存储（可选）
+    // 可选组件
     private InfluxDbStore? _influxStore;
+    private RawPacketArchiver? _archiver;
+    private PlatformForwarder? _forwarder;
     public InfluxDbStore? InfluxStore => _influxStore;
+    public RawPacketArchiver? Archiver => _archiver;
+    public PlatformForwarder? Forwarder => _forwarder;
 
-    public GB32960TcpServer(ILogger<GB32960TcpServer> logger, ServerConfig config, InfluxDbStore? influxStore = null)
+    public GB32960TcpServer(ILogger<GB32960TcpServer> logger, ServerConfig config,
+        InfluxDbStore? influxStore = null, RawPacketArchiver? archiver = null, PlatformForwarder? forwarder = null)
     {
         _logger = logger;
         _config = config;
         _sessionManager = new SessionManager();
         _influxStore = influxStore;
+        _archiver = archiver;
+        _forwarder = forwarder;
     }
 
     public void Start()
@@ -244,6 +251,13 @@ public class GB32960TcpServer
                     data.Length, BitConverter.ToString(data, 0, Math.Min(data.Length, 30)));
                 return;
             }
+
+            // 原始报文存档
+            _archiver?.ArchiveReceived(message.VIN.Trim(), data);
+
+            // 转发到上级平台（实时数据和补发数据）
+            if (message.Command == CommandType.RealtimeData || message.Command == CommandType.SupplementaryData)
+                _forwarder?.ForwardRealtimeData(data);
 
             // 统计命令类型
             _commandStats.AddOrUpdate(message.Command, 1, (_, v) => v + 1);
