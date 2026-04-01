@@ -40,11 +40,16 @@ public class GB32960TcpServer
     public IReadOnlyDictionary<CommandType, long> CommandStats => _commandStats;
     public TimeSpan Uptime => DateTime.Now - _startTime;
 
-    public GB32960TcpServer(ILogger<GB32960TcpServer> logger, ServerConfig config)
+    // InfluxDB 存储（可选）
+    private InfluxDbStore? _influxStore;
+    public InfluxDbStore? InfluxStore => _influxStore;
+
+    public GB32960TcpServer(ILogger<GB32960TcpServer> logger, ServerConfig config, InfluxDbStore? influxStore = null)
     {
         _logger = logger;
         _config = config;
         _sessionManager = new SessionManager();
+        _influxStore = influxStore;
     }
 
     public void Start()
@@ -287,6 +292,8 @@ public class GB32960TcpServer
         _logger.LogInformation("车辆登入: VIN={vin}, ICCID={iccid}, 流水号={seq}, 子系统={sub}",
             msg.VIN, loginData.ICCID, loginData.LoginSequence, loginData.SubsystemCount);
 
+        _influxStore?.WriteVehicleLogin(msg.VIN, loginData);
+
         return GB32960Encoder.EncodeVehicleLoginResponse(msg.VIN, ResponseFlag.Success);
     }
 
@@ -298,6 +305,7 @@ public class GB32960TcpServer
             msg.VIN, time.ToString("yyyy-MM-dd HH:mm:ss"), items.Count);
 
         LogRealtimeItems(msg.VIN, items);
+        _influxStore?.WriteRealtimeData(msg.VIN, time, items);
 
         return GB32960Encoder.EncodeRealtimeDataResponse(msg.VIN, CommandType.RealtimeData);
     }
@@ -308,6 +316,7 @@ public class GB32960TcpServer
         _logger.LogDebug("补发数据: VIN={vin}, 时间={time}, 信息体={count}",
             msg.VIN, time.ToString("yyyy-MM-dd HH:mm:ss"), items.Count);
         LogRealtimeItems(msg.VIN, items);
+        _influxStore?.WriteRealtimeData(msg.VIN, time, items);
         return GB32960Encoder.EncodeRealtimeDataResponse(msg.VIN, CommandType.SupplementaryData);
     }
 
@@ -316,6 +325,7 @@ public class GB32960TcpServer
         var logoutData = GB32960Decoder.DecodeVehicleLogout(msg.Data);
         session.IsLoggedIn = false;
         _logger.LogInformation("车辆登出: VIN={vin}, 流水号={seq}", msg.VIN, logoutData?.LogoutSequence);
+        if (logoutData != null) _influxStore?.WriteVehicleLogout(msg.VIN, logoutData);
         return GB32960Encoder.EncodeResponse(CommandType.VehicleLogout, ResponseFlag.Success, msg.VIN);
     }
 

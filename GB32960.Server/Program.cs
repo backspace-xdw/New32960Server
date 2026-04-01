@@ -21,9 +21,21 @@ using var loggerFactory = LoggerFactory.Create(builder =>
 });
 var logger = loggerFactory.CreateLogger<GB32960TcpServer>();
 
-var server = new GB32960TcpServer(logger, serverConfig);
+// InfluxDB 存储（可选）
+var influxConfig = new InfluxDbConfig();
+config.GetSection("InfluxDb").Bind(influxConfig);
+InfluxDbStore? influxStore = null;
 
-PrintBanner(serverConfig);
+if (influxConfig.Enabled)
+{
+    var influxLogger = loggerFactory.CreateLogger<InfluxDbStore>();
+    influxStore = new InfluxDbStore(influxLogger, influxConfig);
+    influxStore.Start();
+}
+
+var server = new GB32960TcpServer(logger, serverConfig, influxStore);
+
+PrintBanner(serverConfig, influxConfig);
 server.Start();
 
 Console.WriteLine("按键: S=统计  A=自动刷新(5s)  L=终端列表  Q=退出");
@@ -70,7 +82,7 @@ Console.WriteLine("服务器已停止。");
 
 // ─── 显示函数 ────────────────────────────────────
 
-static void PrintBanner(ServerConfig cfg)
+static void PrintBanner(ServerConfig cfg, InfluxDbConfig influx)
 {
     Console.ForegroundColor = ConsoleColor.Cyan;
     Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
@@ -83,8 +95,19 @@ static void PrintBanner(ServerConfig cfg)
     Console.WriteLine($"  监听地址: {cfg.IpAddress}:{cfg.Port}");
     Console.WriteLine($"  最大连接: {cfg.MaxConnections:N0}");
     Console.WriteLine($"  会话超时: {cfg.SessionTimeoutMinutes} 分钟");
-    Console.WriteLine($"  缓冲大小: {cfg.ReceiveBufferSize} 字节");
     Console.WriteLine($"  日志级别: {cfg.LogLevel}");
+    if (influx.Enabled)
+    {
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"  InfluxDB: {influx.Url} → {influx.Org}/{influx.Bucket} (批量{influx.BatchSize})");
+        Console.ResetColor();
+    }
+    else
+    {
+        Console.ForegroundColor = ConsoleColor.DarkGray;
+        Console.WriteLine("  InfluxDB: 未启用 (修改 appsettings.json 中 Enabled=true 开启)");
+        Console.ResetColor();
+    }
     Console.WriteLine();
 }
 
@@ -130,6 +153,16 @@ static void ShowStatistics(GB32960TcpServer server)
             };
             Console.Write($"{name}={count:N0} ");
         }
+        Console.WriteLine();
+    }
+
+    // InfluxDB 统计
+    if (server.InfluxStore != null)
+    {
+        var store = server.InfluxStore;
+        Console.Write("  InfluxDB: 写入="); WriteColored($"{store.TotalWrites:N0}", ConsoleColor.Green);
+        Console.Write("错误="); WriteColored($"{store.TotalErrors:N0}", store.TotalErrors > 0 ? ConsoleColor.Red : ConsoleColor.Green);
+        Console.Write("队列="); WriteColored($"{store.QueueSize:N0}", ConsoleColor.DarkCyan);
         Console.WriteLine();
     }
 
