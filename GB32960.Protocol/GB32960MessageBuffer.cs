@@ -1,25 +1,33 @@
 namespace GB32960.Protocol;
 
 /// <summary>
-/// TCP粘包/半包处理缓冲区
-/// 基于"##"起始符 + 长度字段的帧识别
+/// TCP粘包/半包处理 — 环形缓冲区实现
+/// 避免 List&lt;byte&gt;.RemoveRange 的 O(n) 内存移动
 /// </summary>
 public class GB32960MessageBuffer
 {
-    private readonly List<byte> _buffer = new();
+    private byte[] _buffer;
+    private int _head;  // 有效数据起始
+    private int _tail;  // 有效数据末尾
     private readonly object _lock = new();
 
-    public int BufferSize
+    public GB32960MessageBuffer(int capacity = 8192)
     {
-        get { lock (_lock) return _buffer.Count; }
+        _buffer = new byte[capacity];
+    }
+
+    public int DataLength
+    {
+        get { lock (_lock) return _tail - _head; }
     }
 
     public void Append(byte[] data, int offset, int count)
     {
         lock (_lock)
         {
-            for (int i = offset; i < offset + count; i++)
-                _buffer.Add(data[i]);
+            EnsureCapacity(count);
+            Buffer.BlockCopy(data, offset, _buffer, _tail, count);
+            _tail += count;
         }
     }
 
@@ -31,9 +39,11 @@ public class GB32960MessageBuffer
         {
             while (true)
             {
+                int available = _tail - _head;
+
                 // 查找 ## 起始符
                 int startIndex = -1;
-                for (int i = 0; i < _buffer.Count - 1; i++)
+                for (int i = _head; i < _tail - 1; i++)
                 {
                     if (_buffer[i] == GB32960Constants.START_BYTE &&
                         _buffer[i + 1] == GB32960Constants.START_BYTE)
@@ -43,42 +53,82 @@ public class GB32960MessageBuffer
                     }
                 }
 
-                if (startIndex < 0) break;
-
-                // 丢弃起始符之前的垃圾数据
-                if (startIndex > 0)
+                if (startIndex < 0)
                 {
-                    _buffer.RemoveRange(0, startIndex);
-                    startIndex = 0;
+                    // 没找到起始符，丢弃全部
+                    if (available > 1) _head = _tail - 1;
+                    break;
                 }
 
-                // 检查是否有完整的头部 (24字节)
-                if (_buffer.Count < GB32960Constants.HEADER_LENGTH)
+                // 丢弃起始符之前的数据
+                _head = startIndex;
+                available = _tail - _head;
+
+                // 需要完整头部
+                if (available < GB32960Constants.HEADER_LENGTH)
                     break;
 
-                // 读取数据单元长度 (offset 22-23, big-endian)
-                ushort dataLength = (ushort)((_buffer[22] << 8) | _buffer[23]);
-                int totalLength = GB32960Constants.HEADER_LENGTH + dataLength + 1; // +1 for checksum
+                // 读取数据长度
+                ushort dataLength = (ushort)((_buffer[_head + 22] << 8) | _buffer[_head + 23]);
+                int totalLength = GB32960Constants.HEADER_LENGTH + dataLength + 1;
 
-                // 检查是否有完整消息
-                if (_buffer.Count < totalLength)
+                if (available < totalLength)
                     break;
 
-                // 提取完整消息
+                // 提取完整消息（零拷贝提取）
                 var messageBytes = new byte[totalLength];
-                for (int i = 0; i < totalLength; i++)
-                    messageBytes[i] = _buffer[i];
+                Buffer.BlockCopy(_buffer, _head, messageBytes, 0, totalLength);
+                _head += totalLength;
 
-                _buffer.RemoveRange(0, totalLength);
                 messages.Add(messageBytes);
             }
+
+            // 压缩：将剩余数据移到缓冲区头部
+            Compact();
         }
 
         return messages;
     }
 
+    private void EnsureCapacity(int additionalBytes)
+    {
+        if (_tail + additionalBytes <= _buffer.Length)
+            return;
+
+        // 先尝试压缩
+        if (_head > 0)
+        {
+            Compact();
+            if (_tail + additionalBytes <= _buffer.Length)
+                return;
+        }
+
+        // 扩容
+        int newSize = Math.Max(_buffer.Length * 2, _tail + additionalBytes);
+        var newBuffer = new byte[newSize];
+        int dataLen = _tail - _head;
+        if (dataLen > 0)
+            Buffer.BlockCopy(_buffer, _head, newBuffer, 0, dataLen);
+        _buffer = newBuffer;
+        _head = 0;
+        _tail = dataLen;
+    }
+
+    private void Compact()
+    {
+        int dataLen = _tail - _head;
+        if (_head == 0 || dataLen == 0)
+        {
+            if (dataLen == 0) { _head = 0; _tail = 0; }
+            return;
+        }
+        Buffer.BlockCopy(_buffer, _head, _buffer, 0, dataLen);
+        _head = 0;
+        _tail = dataLen;
+    }
+
     public void Clear()
     {
-        lock (_lock) _buffer.Clear();
+        lock (_lock) { _head = 0; _tail = 0; }
     }
 }

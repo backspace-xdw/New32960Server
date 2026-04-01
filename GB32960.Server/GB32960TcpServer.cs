@@ -185,16 +185,35 @@ public class GB32960TcpServer
         _sessionManager.UpdateActiveTime(session.SessionId);
 
         var messages = session.MessageBuffer.ExtractMessages();
-        foreach (var msgData in messages)
-        {
-            Interlocked.Increment(ref _totalMessagesReceived);
-            session.ReceivedMessages++;
-            Task.Run(() => ProcessMessage(session, msgData));
-        }
 
-        // 归还并继续接收
+        // 归还SAEA并立即开始下一次接收（不阻塞在消息处理上）
         ReturnReceiveArgs(args);
         BeginReceive(session);
+
+        // 消息处理：少量消息直接内联处理，避免线程池调度开销
+        // 大量消息（粘包）才用Task.Run防止阻塞IO线程
+        if (messages.Count <= 2)
+        {
+            foreach (var msgData in messages)
+            {
+                Interlocked.Increment(ref _totalMessagesReceived);
+                session.ReceivedMessages++;
+                ProcessMessage(session, msgData);
+            }
+        }
+        else
+        {
+            foreach (var msgData in messages)
+            {
+                Interlocked.Increment(ref _totalMessagesReceived);
+                session.ReceivedMessages++;
+            }
+            Task.Run(() =>
+            {
+                foreach (var msgData in messages)
+                    ProcessMessage(session, msgData);
+            });
+        }
     }
 
     private void HandleDisconnect(SessionInfo session)
