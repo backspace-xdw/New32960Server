@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using GB32960.Protocol;
@@ -14,16 +16,29 @@ public class GB32960TcpServer
     private Socket? _serverSocket;
     private bool _isRunning;
 
+    // SocketAsyncEventArgs 对象池
+    private readonly ConcurrentStack<SocketAsyncEventArgs> _receiveArgsPool = new();
+    private int _poolCreated;
+
+    // 统计
     private long _totalMessagesReceived;
     private long _totalMessagesSent;
     private long _totalConnections;
     private long _totalDisconnections;
+    private long _totalBytesReceived;
+    private long _totalBytesSent;
+    private readonly ConcurrentDictionary<CommandType, long> _commandStats = new();
+    private DateTime _startTime;
 
     public SessionManager Sessions => _sessionManager;
     public long TotalMessagesReceived => Interlocked.Read(ref _totalMessagesReceived);
     public long TotalMessagesSent => Interlocked.Read(ref _totalMessagesSent);
     public long TotalConnections => Interlocked.Read(ref _totalConnections);
     public long TotalDisconnections => Interlocked.Read(ref _totalDisconnections);
+    public long TotalBytesReceived => Interlocked.Read(ref _totalBytesReceived);
+    public long TotalBytesSent => Interlocked.Read(ref _totalBytesSent);
+    public IReadOnlyDictionary<CommandType, long> CommandStats => _commandStats;
+    public TimeSpan Uptime => DateTime.Now - _startTime;
 
     public GB32960TcpServer(ILogger<GB32960TcpServer> logger, ServerConfig config)
     {
@@ -34,6 +49,15 @@ public class GB32960TcpServer
 
     public void Start()
     {
+        _startTime = DateTime.Now;
+
+        // 预分配 SocketAsyncEventArgs 池
+        int preAlloc = Math.Min(_config.MaxConnections, 10000);
+        for (int i = 0; i < preAlloc; i++)
+            _receiveArgsPool.Push(CreateReceiveArgs());
+        _poolCreated = preAlloc;
+        _logger.LogInformation("预分配 SocketAsyncEventArgs: {count}", preAlloc);
+
         _serverSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         _serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
         _serverSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
@@ -41,13 +65,9 @@ public class GB32960TcpServer
         _serverSocket.Listen(_config.MaxConnections);
 
         _isRunning = true;
-        _logger.LogInformation("GB/T 32960 服务器已启动 - {ip}:{port}, 最大连接: {max}",
-            _config.IpAddress, _config.Port, _config.MaxConnections);
+        _logger.LogInformation("GB/T 32960 服务器已启动 - {ip}:{port}", _config.IpAddress, _config.Port);
 
-        // 开始接受连接
         BeginAccept();
-
-        // 启动会话清理定时器
         Task.Run(CleanupTask);
     }
 
@@ -55,7 +75,38 @@ public class GB32960TcpServer
     {
         _isRunning = false;
         try { _serverSocket?.Close(); } catch { }
+        // 关闭所有会话
+        foreach (var s in _sessionManager.GetAllSessions())
+            _sessionManager.RemoveSession(s.SessionId);
         _logger.LogInformation("服务器已停止");
+    }
+
+    // ─── SocketAsyncEventArgs 池 ─────────────────
+
+    private SocketAsyncEventArgs CreateReceiveArgs()
+    {
+        var args = new SocketAsyncEventArgs();
+        args.Completed += OnReceiveCompleted;
+        // 使用 ArrayPool 租借缓冲区
+        var buffer = ArrayPool<byte>.Shared.Rent(_config.ReceiveBufferSize);
+        args.SetBuffer(buffer, 0, _config.ReceiveBufferSize);
+        return args;
+    }
+
+    private SocketAsyncEventArgs RentReceiveArgs()
+    {
+        if (_receiveArgsPool.TryPop(out var args))
+            return args;
+        // 池耗尽，动态创建
+        Interlocked.Increment(ref _poolCreated);
+        return CreateReceiveArgs();
+    }
+
+    private void ReturnReceiveArgs(SocketAsyncEventArgs args)
+    {
+        args.UserToken = null;
+        args.AcceptSocket = null;
+        _receiveArgsPool.Push(args);
     }
 
     // ─── Accept ──────────────────────────────────
@@ -80,6 +131,7 @@ public class GB32960TcpServer
         if (args.SocketError == SocketError.Success && args.AcceptSocket != null)
         {
             var clientSocket = args.AcceptSocket;
+            clientSocket.NoDelay = true;
             var session = _sessionManager.AddSession(clientSocket);
             Interlocked.Increment(ref _totalConnections);
 
@@ -99,10 +151,8 @@ public class GB32960TcpServer
     {
         if (!_isRunning || !session.Socket.Connected) return;
 
-        var args = new SocketAsyncEventArgs();
-        args.SetBuffer(new byte[_config.ReceiveBufferSize], 0, _config.ReceiveBufferSize);
+        var args = RentReceiveArgs();
         args.UserToken = session;
-        args.Completed += OnReceiveCompleted;
 
         try
         {
@@ -112,8 +162,8 @@ public class GB32960TcpServer
         catch (Exception ex)
         {
             _logger.LogDebug("接收异常: {msg}", ex.Message);
+            ReturnReceiveArgs(args);
             HandleDisconnect(session);
-            args.Dispose();
         }
     }
 
@@ -125,16 +175,15 @@ public class GB32960TcpServer
 
         if (args.SocketError != SocketError.Success || args.BytesTransferred <= 0)
         {
+            ReturnReceiveArgs(args);
             HandleDisconnect(session);
-            args.Dispose();
             return;
         }
 
-        // 追加到消息缓冲区
+        Interlocked.Add(ref _totalBytesReceived, args.BytesTransferred);
         session.MessageBuffer.Append(args.Buffer!, args.Offset, args.BytesTransferred);
         _sessionManager.UpdateActiveTime(session.SessionId);
 
-        // 提取完整消息
         var messages = session.MessageBuffer.ExtractMessages();
         foreach (var msgData in messages)
         {
@@ -143,13 +192,17 @@ public class GB32960TcpServer
             Task.Run(() => ProcessMessage(session, msgData));
         }
 
-        args.Dispose();
+        // 归还并继续接收
+        ReturnReceiveArgs(args);
         BeginReceive(session);
     }
 
     private void HandleDisconnect(SessionInfo session)
     {
-        _logger.LogDebug("断开连接: VIN={vin}, SessionId={sid}", session.VIN, session.SessionId);
+        if (string.IsNullOrEmpty(session.VIN))
+            _logger.LogDebug("断开: SessionId={sid}", session.SessionId);
+        else
+            _logger.LogInformation("断开: VIN={vin}", session.VIN);
         Interlocked.Increment(ref _totalDisconnections);
         _sessionManager.RemoveSession(session.SessionId);
     }
@@ -163,13 +216,17 @@ public class GB32960TcpServer
             var message = GB32960Decoder.Decode(data);
             if (message == null)
             {
-                _logger.LogWarning("消息解码失败, SessionId={sid}, Len={len}", session.SessionId, data.Length);
+                _logger.LogWarning("消息解码失败, Len={len}, Hex={hex}",
+                    data.Length, BitConverter.ToString(data, 0, Math.Min(data.Length, 30)));
                 return;
             }
 
+            // 统计命令类型
+            _commandStats.AddOrUpdate(message.Command, 1, (_, v) => v + 1);
+
             // 绑定VIN
-            if (string.IsNullOrEmpty(session.VIN) && !string.IsNullOrEmpty(message.VIN))
-                _sessionManager.BindVin(session.SessionId, message.VIN);
+            if (string.IsNullOrEmpty(session.VIN) && !string.IsNullOrEmpty(message.VIN.Trim()))
+                _sessionManager.BindVin(session.SessionId, message.VIN.Trim());
 
             byte[]? response = message.Command switch
             {
@@ -185,7 +242,7 @@ public class GB32960TcpServer
             };
 
             if (response != null)
-                SendData(session, response);
+                SendDataAsync(session, response);
         }
         catch (Exception ex)
         {
@@ -208,7 +265,7 @@ public class GB32960TcpServer
         session.ICCID = loginData.ICCID;
         session.LoginSequence = loginData.LoginSequence;
 
-        _logger.LogInformation("车辆登入: VIN={vin}, ICCID={iccid}, 流水号={seq}, 子系统数={sub}",
+        _logger.LogInformation("车辆登入: VIN={vin}, ICCID={iccid}, 流水号={seq}, 子系统={sub}",
             msg.VIN, loginData.ICCID, loginData.LoginSequence, loginData.SubsystemCount);
 
         return GB32960Encoder.EncodeVehicleLoginResponse(msg.VIN, ResponseFlag.Success);
@@ -218,27 +275,10 @@ public class GB32960TcpServer
     {
         var (time, items) = GB32960Decoder.DecodeRealtimeData(msg.Data);
 
-        _logger.LogDebug("实时数据: VIN={vin}, 时间={time}, 信息体数={count}",
+        _logger.LogDebug("实时数据: VIN={vin}, 时间={time}, 信息体={count}",
             msg.VIN, time.ToString("yyyy-MM-dd HH:mm:ss"), items.Count);
 
-        foreach (var item in items)
-        {
-            switch (item)
-            {
-                case VehicleData vd:
-                    _logger.LogDebug("  整车: 状态={s}, SOC={soc}%, 速度={spd}km/h, 里程={mil}km, 电压={v}V, 电流={a}A",
-                        vd.Status, vd.SOC, vd.GetSpeedKmh(), vd.GetMileageKm(), vd.GetVoltageV(), vd.GetCurrentA());
-                    break;
-                case VehiclePositionData pos:
-                    _logger.LogDebug("  位置: 经度={lon}, 纬度={lat}, 有效={v}",
-                        pos.GetLongitude().ToString("F6"), pos.GetLatitude().ToString("F6"), pos.IsValid);
-                    break;
-                case AlarmData alarm when alarm.MaxAlarmLevel > 0:
-                    _logger.LogWarning("  报警: VIN={vin}, 等级={lv}, 标志=0x{flags:X8}",
-                        msg.VIN, alarm.MaxAlarmLevel, alarm.GeneralAlarmFlags);
-                    break;
-            }
-        }
+        LogRealtimeItems(msg.VIN, items);
 
         return GB32960Encoder.EncodeRealtimeDataResponse(msg.VIN, CommandType.RealtimeData);
     }
@@ -246,8 +286,9 @@ public class GB32960TcpServer
     private byte[]? HandleSupplementaryData(SessionInfo session, GB32960Message msg)
     {
         var (time, items) = GB32960Decoder.DecodeRealtimeData(msg.Data);
-        _logger.LogDebug("补发数据: VIN={vin}, 时间={time}, 信息体数={count}",
+        _logger.LogDebug("补发数据: VIN={vin}, 时间={time}, 信息体={count}",
             msg.VIN, time.ToString("yyyy-MM-dd HH:mm:ss"), items.Count);
+        LogRealtimeItems(msg.VIN, items);
         return GB32960Encoder.EncodeRealtimeDataResponse(msg.VIN, CommandType.SupplementaryData);
     }
 
@@ -255,8 +296,7 @@ public class GB32960TcpServer
     {
         var logoutData = GB32960Decoder.DecodeVehicleLogout(msg.Data);
         session.IsLoggedIn = false;
-        _logger.LogInformation("车辆登出: VIN={vin}, 流水号={seq}",
-            msg.VIN, logoutData?.LogoutSequence);
+        _logger.LogInformation("车辆登出: VIN={vin}, 流水号={seq}", msg.VIN, logoutData?.LogoutSequence);
         return GB32960Encoder.EncodeResponse(CommandType.VehicleLogout, ResponseFlag.Success, msg.VIN);
     }
 
@@ -290,15 +330,83 @@ public class GB32960TcpServer
         return GB32960Encoder.EncodeResponse(msg.Command, ResponseFlag.Invalid, msg.VIN);
     }
 
-    // ─── 发送 ────────────────────────────────────
+    // ─── 实时数据详细日志 ─────────────────────────
 
-    private void SendData(SessionInfo session, byte[] data)
+    private void LogRealtimeItems(string vin, List<IRealtimeInfoItem> items)
+    {
+        foreach (var item in items)
+        {
+            switch (item)
+            {
+                case VehicleData vd:
+                    _logger.LogDebug("  [{vin}] 整车: 状态={s}, SOC={soc}%, 速度={spd:F1}km/h, 里程={mil:F1}km, {v:F1}V/{a:F1}A",
+                        vin, vd.Status, vd.SOC, vd.GetSpeedKmh(), vd.GetMileageKm(), vd.GetVoltageV(), vd.GetCurrentA());
+                    break;
+                case DriveMotorData dm:
+                    foreach (var m in dm.Motors)
+                        _logger.LogDebug("  [{vin}] 电机#{seq}: 状态={s}, RPM={rpm}, 温度={t}℃",
+                            vin, m.Sequence, m.State, m.GetRPM(), m.GetMotorTempC());
+                    break;
+                case FuelCellData fc:
+                    _logger.LogDebug("  [{vin}] 燃料电池: {v:F1}V, {a:F1}A, 探针数={n}",
+                        vin, fc.Voltage / 10.0, fc.Current / 10.0, fc.TempProbeCount);
+                    break;
+                case EngineData eng:
+                    _logger.LogDebug("  [{vin}] 发动机: 状态={s}, RPM={rpm}",
+                        vin, eng.State, eng.CrankshaftRPM);
+                    break;
+                case VehiclePositionData pos:
+                    _logger.LogDebug("  [{vin}] 位置: {lon:F6},{lat:F6}, 有效={v}",
+                        vin, pos.GetLongitude(), pos.GetLatitude(), pos.IsValid);
+                    break;
+                case ExtremeValueData ev:
+                    _logger.LogDebug("  [{vin}] 极值: 电压{maxV:F3}~{minV:F3}V, 温度{maxT}~{minT}℃",
+                        vin, ev.GetMaxVoltageV(), ev.GetMinVoltageV(), ev.GetMaxTempC(), ev.GetMinTempC());
+                    break;
+                case AlarmData alarm:
+                    if (alarm.MaxAlarmLevel > 0)
+                        _logger.LogWarning("  [{vin}] 报警! 等级={lv}, 标志=0x{flags:X8}, 电池故障={bf}, 电机故障={mf}",
+                            vin, alarm.MaxAlarmLevel, alarm.GeneralAlarmFlags,
+                            alarm.BatteryFaultCount, alarm.MotorFaultCount);
+                    break;
+                case BatteryVoltageData bv:
+                    _logger.LogDebug("  [{vin}] 电压: {n}个子系统, 总单体={cells}",
+                        vin, bv.SubsystemCount, bv.Subsystems.Sum(s => s.TotalCellCount));
+                    break;
+                case BatteryTemperatureData bt:
+                    _logger.LogDebug("  [{vin}] 温度: {n}个子系统, 总探针={probes}",
+                        vin, bt.SubsystemCount, bt.Subsystems.Sum(s => s.ProbeCount));
+                    break;
+            }
+        }
+    }
+
+    // ─── 异步发送 ────────────────────────────────
+
+    private void SendDataAsync(SessionInfo session, byte[] data)
     {
         try
         {
-            session.Socket.Send(data, 0, data.Length, SocketFlags.None);
-            Interlocked.Increment(ref _totalMessagesSent);
-            session.SentMessages++;
+            var args = new SocketAsyncEventArgs();
+            args.SetBuffer(data, 0, data.Length);
+            args.Completed += (_, e) =>
+            {
+                if (e.SocketError == SocketError.Success)
+                {
+                    Interlocked.Increment(ref _totalMessagesSent);
+                    Interlocked.Add(ref _totalBytesSent, e.BytesTransferred);
+                    session.SentMessages++;
+                }
+                e.Dispose();
+            };
+
+            if (!session.Socket.SendAsync(args))
+            {
+                Interlocked.Increment(ref _totalMessagesSent);
+                Interlocked.Add(ref _totalBytesSent, data.Length);
+                session.SentMessages++;
+                args.Dispose();
+            }
         }
         catch (Exception ex)
         {
@@ -326,7 +434,7 @@ public class GB32960TcpServer
     {
         var session = _sessionManager.GetSessionByVin(vin);
         if (session == null) return false;
-        SendData(session, GB32960Encoder.EncodeQuery(vin, queryData));
+        SendDataAsync(session, GB32960Encoder.EncodeQuery(vin, queryData));
         return true;
     }
 
@@ -334,7 +442,7 @@ public class GB32960TcpServer
     {
         var session = _sessionManager.GetSessionByVin(vin);
         if (session == null) return false;
-        SendData(session, GB32960Encoder.EncodeSetup(vin, setupData));
+        SendDataAsync(session, GB32960Encoder.EncodeSetup(vin, setupData));
         return true;
     }
 
@@ -342,7 +450,7 @@ public class GB32960TcpServer
     {
         var session = _sessionManager.GetSessionByVin(vin);
         if (session == null) return false;
-        SendData(session, GB32960Encoder.EncodeControl(vin, controlData));
+        SendDataAsync(session, GB32960Encoder.EncodeControl(vin, controlData));
         return true;
     }
 }
